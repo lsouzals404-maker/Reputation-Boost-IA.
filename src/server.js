@@ -24,6 +24,9 @@ import { discardReviewReply, generateReplyForReview, getReviewById, getReviews, 
 import { createSession, destroySession, getSession } from "./services/session-manager.js";
 import { getSettings, updateSettings } from "./services/settings-service.js";
 
+// ✅ IMPORT DO ASAAS
+import { validateTransfer } from "./services/asaas-service.js";
+
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -121,55 +124,29 @@ function requireAuth(req, res) {
   return userId;
 }
 
-function buildGoogleIdentityAuthUrl() {
-  const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
-  const state = createSignedState(config.sessionSecret, {
-    intent: "auth",
-    createdAt: Date.now(),
-  });
-  url.searchParams.set("client_id", config.googleClientId);
-  url.searchParams.set("redirect_uri", config.googleRedirectUri);
-  url.searchParams.set("response_type", "code");
-  url.searchParams.set("scope", "openid email profile");
-  url.searchParams.set("access_type", "offline");
-  url.searchParams.set("include_granted_scopes", "true");
-  url.searchParams.set("prompt", "consent");
-  url.searchParams.set("state", state);
-  return url.toString();
-}
-
-async function exchangeGoogleCode(code) {
-  const response = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      code,
-      client_id: config.googleClientId,
-      client_secret: config.googleClientSecret,
-      redirect_uri: config.googleRedirectUri,
-      grant_type: "authorization_code",
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Google token endpoint returned ${response.status}`);
-  }
-  return response.json();
-}
-
-async function fetchGoogleUserProfile(accessToken) {
-  const response = await fetch("https://openidconnect.googleapis.com/v1/userinfo", {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`Google userinfo returned ${response.status}`);
-  }
-  return response.json();
-}
-
 async function handleApiRequest(req, res, url) {
+
+  // ✅ WEBHOOK ASAAS (ANTES DE QUALQUER AUTH)
+  if (req.method === "POST" && url.pathname === "/api/asaas/validate-transfer") {
+    const asaasToken = req.headers["asaas-access-token"];
+    const secretToken = "Nicolas e Emili";
+
+    if (asaasToken !== secretToken) {
+      sendJson(res, 401, { error: "Não autorizado" });
+      return;
+    }
+
+    const payload = await readJsonBody(req);
+
+    console.log("[ASAAS WEBHOOK RECEBIDO]");
+    console.log(payload);
+
+    const result = validateTransfer(payload);
+
+    sendJson(res, 200, result);
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/health") {
     sendJson(res, 200, {
       ok: true,
@@ -196,194 +173,15 @@ async function handleApiRequest(req, res, url) {
     return;
   }
 
-  if (req.method === "POST" && url.pathname === "/api/auth/google") {
-    if (isGoogleConfigured()) {
-      sendJson(res, 200, { authorizationUrl: buildGoogleIdentityAuthUrl(), mode: "oauth" });
-      return;
-    }
-
-    const payload = await readJsonBody(req);
-    const user = await findOrCreateUserFromGoogle({
-      name: payload.name || "Google Demo User",
-      email: payload.email || "google-demo@reputationboost.local",
-    });
-    makeSessionCookie(res, user.id);
-    sendJson(res, 200, {
-      user,
-      mode: "demo",
-      message: "OAuth real nao configurado. Login Google em modo demonstracao aplicado para o MVP local.",
-    });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/auth/logout") {
-    clearSessionCookie(req, res);
-    sendJson(res, 200, { success: true });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/auth/forgot-password") {
-    const payload = await readJsonBody(req);
-    const result = await requestPasswordReset(payload.email);
-    sendJson(res, 200, result);
-    return;
-  }
-
   const userId = requireAuth(req, res);
-  if (!userId) {
-    return;
-  }
+  if (!userId) return;
 
   if (req.method === "GET" && url.pathname === "/api/bootstrap") {
     sendJson(res, 200, await buildBootstrapPayload(userId));
     return;
   }
 
-  if (req.method === "GET" && url.pathname === "/api/dashboard") {
-    sendJson(res, 200, await getDashboardData(userId));
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/settings") {
-    sendJson(res, 200, await getSettings(userId));
-    return;
-  }
-
-  if (req.method === "PUT" && url.pathname === "/api/settings") {
-    const payload = await readJsonBody(req);
-    sendJson(res, 200, await updateSettings(userId, payload));
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/reviews") {
-    sendJson(
-      res,
-      200,
-      await getReviews(userId, {
-        status: url.searchParams.get("status") || "all",
-        sort: url.searchParams.get("sort") || "newest",
-        search: url.searchParams.get("search") || "",
-      }),
-    );
-    return;
-  }
-
-  const reviewMatch = url.pathname.match(/^\/api\/reviews\/([^/]+)$/);
-  if (req.method === "GET" && reviewMatch) {
-    const review = await getReviewById(userId, reviewMatch[1]);
-    if (!review) {
-      sendJson(res, 404, { error: "Avaliacao nao encontrada." });
-      return;
-    }
-    sendJson(res, 200, review);
-    return;
-  }
-
-  const generateMatch = url.pathname.match(/^\/api\/reviews\/([^/]+)\/generate$/);
-  if (req.method === "POST" && generateMatch) {
-    sendJson(res, 200, await generateReplyForReview(userId, generateMatch[1]));
-    return;
-  }
-
-  const replyMatch = url.pathname.match(/^\/api\/reviews\/([^/]+)\/reply$/);
-  if (req.method === "PUT" && replyMatch) {
-    const payload = await readJsonBody(req);
-    sendJson(res, 200, await saveReviewDraft(userId, replyMatch[1], payload.draftReply));
-    return;
-  }
-
-  const publishMatch = url.pathname.match(/^\/api\/reviews\/([^/]+)\/publish$/);
-  if (req.method === "POST" && publishMatch) {
-    const payload = await readJsonBody(req);
-    sendJson(res, 200, await publishReviewReply(userId, publishMatch[1], payload.draftReply));
-    return;
-  }
-
-  const discardMatch = url.pathname.match(/^\/api\/reviews\/([^/]+)\/discard$/);
-  if (req.method === "POST" && discardMatch) {
-    sendJson(res, 200, await discardReviewReply(userId, discardMatch[1]));
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/google/connect/start") {
-    sendJson(res, 200, await startGoogleConnection(userId));
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/google/connect/complete") {
-    const payload = await readJsonBody(req);
-    const selectedLocationIds = Array.isArray(payload.selectedLocationIds) ? payload.selectedLocationIds : [];
-    const result = payload.mode === "demo"
-      ? await completeDemoGoogleConnection(userId, selectedLocationIds)
-      : await saveSelectedLocations(userId, selectedLocationIds);
-    sendJson(res, 200, result);
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/agency") {
-    sendJson(res, 200, await getAgencyData(userId));
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/agency/clients") {
-    const payload = await readJsonBody(req);
-    sendJson(res, 201, await addAgencyClient(userId, payload));
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/subscription") {
-    sendJson(res, 200, await getSubscriptionData(userId));
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/subscription/portal") {
-    sendJson(res, 200, await createBillingPortalSession(userId));
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/subscription/cancel") {
-    sendJson(res, 200, await cancelSubscription(userId));
-    return;
-  }
-
   sendJson(res, 404, { error: "Rota nao encontrada." });
-}
-
-async function handleOAuthCallback(req, res, url) {
-  const code = url.searchParams.get("code");
-  const stateValue = url.searchParams.get("state");
-  const error = url.searchParams.get("error");
-
-  if (error) {
-    redirect(res, "/#auth-error=google");
-    return;
-  }
-
-  if (!code || !stateValue) {
-    redirect(res, "/#auth-error=missing-code");
-    return;
-  }
-
-  const payload = verifySignedState(config.sessionSecret, stateValue);
-
-  if (payload?.intent === "auth") {
-    if (Date.now() - Number(payload.createdAt || 0) > 15 * 60 * 1000) {
-      redirect(res, "/#auth-error=expired-state");
-      return;
-    }
-    const tokenPayload = await exchangeGoogleCode(code);
-    const profile = await fetchGoogleUserProfile(tokenPayload.access_token);
-    const user = await findOrCreateUserFromGoogle({
-      name: profile.name,
-      email: profile.email,
-    });
-    makeSessionCookie(res, user.id);
-    redirect(res, "/#dashboard?google-auth=success");
-    return;
-  }
-
-  await handleGoogleOAuthCallback(code, stateValue);
-  redirect(res, "/#settings?google-connected=1");
 }
 
 function handleError(res, error) {
@@ -396,11 +194,6 @@ async function requestListener(req, res) {
   const url = new URL(req.url, config.appUrl);
 
   try {
-    if (url.pathname === "/oauth/google/callback" || url.pathname === "/auth/google/callback") {
-      await handleOAuthCallback(req, res, url);
-      return;
-    }
-
     if (url.pathname.startsWith("/api/")) {
       await handleApiRequest(req, res, url);
       return;
@@ -423,5 +216,5 @@ await readState();
 
 const server = http.createServer(requestListener);
 server.listen(config.port, () => {
-  console.log(`Reputation Boost IA MVP rodando em ${config.appUrl}`);
+  console.log(`Servidor rodando em ${config.appUrl}`);
 });
