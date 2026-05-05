@@ -4,7 +4,6 @@ import path from "node:path";
 
 import { config, isGoogleConfigured, isOpenAiConfigured } from "./config.js";
 import {
-  clearCookie,
   createSignedState,
   parseCookies,
   readJsonBody,
@@ -25,19 +24,19 @@ import { getSubscriptionData } from "./services/billing-service.js";
 import { getDashboardData } from "./services/dashboard-service.js";
 import { handleGoogleOAuthCallback } from "./services/google-service.js";
 import { getReviews } from "./services/reviews-service.js";
-import {
-  createSession,
-  destroySession,
-  getSession,
-} from "./services/session-manager.js";
+import { createSession, getSession } from "./services/session-manager.js";
 import { getSettings } from "./services/settings-service.js";
-import { validateTransfer } from "./services/asaas-service.js";
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".js": "application/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".ico": "image/x-icon",
 };
 
 function getAuthenticatedUserId(req) {
@@ -48,7 +47,12 @@ function getAuthenticatedUserId(req) {
 
 function makeSessionCookie(res, userId) {
   const session = createSession(userId);
-  setCookie(res, "rb_session", session.token, { maxAge: session.maxAge });
+  setCookie(res, "rb_session", session.token, {
+    maxAge: session.maxAge,
+    httpOnly: true,
+    secure: true,
+    sameSite: "none",
+  });
 }
 
 async function buildBootstrapPayload(userId) {
@@ -91,6 +95,7 @@ async function serveIndex(res) {
   const content = await fs.readFile(filePath);
   res.writeHead(200, {
     "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
   });
   res.end(content);
 }
@@ -105,6 +110,16 @@ function requireAuth(req, res) {
 }
 
 async function handleApiRequest(req, res, url) {
+  // ✅ HEALTH
+  if (req.method === "GET" && url.pathname === "/api/health") {
+    sendJson(res, 200, {
+      ok: true,
+      googleConfigured: isGoogleConfigured(),
+      openAiConfigured: isOpenAiConfigured(),
+    });
+    return;
+  }
+
   // 🔥 GOOGLE OAUTH START
   if (req.method === "GET" && url.pathname === "/api/auth/google") {
     if (!isGoogleConfigured()) {
@@ -123,11 +138,14 @@ async function handleApiRequest(req, res, url) {
     authUrl.searchParams.set("response_type", "code");
     authUrl.searchParams.set("scope", config.googleScopes.join(" "));
     authUrl.searchParams.set("state", state);
+    authUrl.searchParams.set("access_type", "offline");
+    authUrl.searchParams.set("prompt", "consent");
 
     redirect(res, authUrl.toString());
     return;
   }
 
+  // AUTH
   if (req.method === "POST" && url.pathname === "/api/auth/login") {
     const payload = await readJsonBody(req);
     const user = await loginUser(payload);
@@ -159,7 +177,7 @@ async function requestListener(req, res) {
   const url = new URL(req.url, config.appUrl);
 
   try {
-    // 🔥 CALLBACK GOOGLE (CORRETO)
+    // 🔥 GOOGLE CALLBACK
     if (url.pathname === "/oauth/google/callback") {
       const { code, state } = Object.fromEntries(url.searchParams);
 
@@ -176,14 +194,32 @@ async function requestListener(req, res) {
       return;
     }
 
+    // API
     if (url.pathname.startsWith("/api/")) {
       await handleApiRequest(req, res, url);
       return;
     }
 
-    await serveIndex(res);
+    // 🔥 STATIC FILES
+    const filePath = path.join(config.publicDir, url.pathname);
+
+    try {
+      const content = await fs.readFile(filePath);
+      const ext = path.extname(filePath);
+
+      res.writeHead(200, {
+        "Content-Type": MIME_TYPES[ext] || "application/octet-stream",
+        "Cache-Control": "no-store",
+      });
+
+      res.end(content);
+      return;
+    } catch {
+      // fallback SPA
+      await serveIndex(res);
+    }
   } catch (err) {
-    console.error(err);
+    console.error("[server error]", err);
     sendJson(res, 500, { error: "Erro interno" });
   }
 }
@@ -193,6 +229,6 @@ await readState();
 
 const server = http.createServer(requestListener);
 
-server.listen(config.port, () => {
+server.listen(process.env.PORT || config.port, () => {
   console.log(`Rodando em ${config.appUrl}`);
 });
