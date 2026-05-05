@@ -12,19 +12,25 @@ import {
   sendJson,
   sendText,
   setCookie,
-  verifySignedState,
 } from "./http.js";
 import { ensureStore, readState } from "./store.js";
-import { addAgencyClient, getAgencyData } from "./services/agency-service.js";
-import { findOrCreateUserFromGoogle, getUserById, getWorkspaceByUserId, loginUser, registerUser, requestPasswordReset } from "./services/auth-service.js";
-import { cancelSubscription, createBillingPortalSession, getSubscriptionData } from "./services/billing-service.js";
+import { getAgencyData } from "./services/agency-service.js";
+import {
+  getUserById,
+  getWorkspaceByUserId,
+  loginUser,
+  registerUser,
+} from "./services/auth-service.js";
+import { getSubscriptionData } from "./services/billing-service.js";
 import { getDashboardData } from "./services/dashboard-service.js";
-import { completeDemoGoogleConnection, handleGoogleOAuthCallback, saveSelectedLocations, startGoogleConnection } from "./services/google-service.js";
-import { discardReviewReply, generateReplyForReview, getReviewById, getReviews, publishReviewReply, saveReviewDraft } from "./services/reviews-service.js";
-import { createSession, destroySession, getSession } from "./services/session-manager.js";
-import { getSettings, updateSettings } from "./services/settings-service.js";
-
-// ✅ IMPORT DO ASAAS
+import { handleGoogleOAuthCallback } from "./services/google-service.js";
+import { getReviews } from "./services/reviews-service.js";
+import {
+  createSession,
+  destroySession,
+  getSession,
+} from "./services/session-manager.js";
+import { getSettings } from "./services/settings-service.js";
 import { validateTransfer } from "./services/asaas-service.js";
 
 const MIME_TYPES = {
@@ -32,11 +38,6 @@ const MIME_TYPES = {
   ".css": "text/css; charset=utf-8",
   ".js": "application/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
-  ".svg": "image/svg+xml",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".ico": "image/x-icon",
 };
 
 function getAuthenticatedUserId(req) {
@@ -50,14 +51,16 @@ function makeSessionCookie(res, userId) {
   setCookie(res, "rb_session", session.token, { maxAge: session.maxAge });
 }
 
-function clearSessionCookie(req, res) {
-  const cookies = parseCookies(req.headers.cookie || "");
-  destroySession(cookies.rb_session);
-  clearCookie(res, "rb_session");
-}
-
 async function buildBootstrapPayload(userId) {
-  const [user, workspace, dashboard, reviews, settings, agency, subscription] = await Promise.all([
+  const [
+    user,
+    workspace,
+    dashboard,
+    reviews,
+    settings,
+    agency,
+    subscription,
+  ] = await Promise.all([
     getUserById(userId),
     getWorkspaceByUserId(userId),
     getDashboardData(userId),
@@ -78,7 +81,6 @@ async function buildBootstrapPayload(userId) {
     integrations: {
       openAiConfigured: isOpenAiConfigured(),
       googleConfigured: isGoogleConfigured(),
-      billingProvider: subscription?.provider || config.billingProvider,
       appUrl: config.appUrl,
     },
   };
@@ -89,79 +91,40 @@ async function serveIndex(res) {
   const content = await fs.readFile(filePath);
   res.writeHead(200, {
     "Content-Type": "text/html; charset=utf-8",
-    "Cache-Control": "no-store",
   });
   res.end(content);
-}
-
-async function serveStaticFile(res, pathname) {
-  const sanitizedPath = path.normalize(pathname.replace(/^\/+/, "")).replace(/^(\.\.[/\\])+/, "");
-  const filePath = path.join(config.publicDir, sanitizedPath);
-  if (!filePath.startsWith(config.publicDir)) {
-    sendText(res, 403, "Acesso negado.");
-    return;
-  }
-
-  const extension = path.extname(filePath).toLowerCase();
-  try {
-    const content = await fs.readFile(filePath);
-    res.writeHead(200, {
-      "Content-Type": MIME_TYPES[extension] || "application/octet-stream",
-      "Cache-Control": "no-store",
-    });
-    res.end(content);
-  } catch {
-    await serveIndex(res);
-  }
 }
 
 function requireAuth(req, res) {
   const userId = getAuthenticatedUserId(req);
   if (!userId) {
-    sendJson(res, 401, { error: "Sessao expirada. Entre novamente." });
+    sendJson(res, 401, { error: "Sessão expirada" });
     return null;
   }
   return userId;
 }
 
 async function handleApiRequest(req, res, url) {
-
-  // ✅ WEBHOOK ASAAS (ANTES DE QUALQUER AUTH)
-  if (req.method === "POST" && url.pathname === "/api/asaas/validate-transfer") {
-    const asaasToken = req.headers["asaas-access-token"];
-    const secretToken = "Nicolas e Emili";
-
-    if (asaasToken !== secretToken) {
-      sendJson(res, 401, { error: "Não autorizado" });
+  // 🔥 GOOGLE OAUTH START
+  if (req.method === "GET" && url.pathname === "/api/auth/google") {
+    if (!isGoogleConfigured()) {
+      sendJson(res, 500, { error: "Google não configurado" });
       return;
     }
 
-    const payload = await readJsonBody(req);
+    const state = createSignedState({ ts: Date.now() });
 
-    console.log("[ASAAS WEBHOOK RECEBIDO]");
-    console.log(payload);
+    const authUrl = new URL(
+      "https://accounts.google.com/o/oauth2/v2/auth"
+    );
 
-    const result = validateTransfer(payload);
+    authUrl.searchParams.set("client_id", config.googleClientId);
+    authUrl.searchParams.set("redirect_uri", config.googleRedirectUri);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("scope", config.googleScopes.join(" "));
+    authUrl.searchParams.set("state", state);
 
-    sendJson(res, 200, result);
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/health") {
-    sendJson(res, 200, {
-      ok: true,
-      googleConfigured: isGoogleConfigured(),
-      openAiConfigured: isOpenAiConfigured(),
-      billingProvider: config.billingProvider,
-    });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/auth/register") {
-    const payload = await readJsonBody(req);
-    const user = await registerUser(payload);
-    makeSessionCookie(res, user.id);
-    sendJson(res, 201, { user });
+    redirect(res, authUrl.toString());
     return;
   }
 
@@ -173,6 +136,14 @@ async function handleApiRequest(req, res, url) {
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/auth/register") {
+    const payload = await readJsonBody(req);
+    const user = await registerUser(payload);
+    makeSessionCookie(res, user.id);
+    sendJson(res, 201, { user });
+    return;
+  }
+
   const userId = requireAuth(req, res);
   if (!userId) return;
 
@@ -181,33 +152,39 @@ async function handleApiRequest(req, res, url) {
     return;
   }
 
-  sendJson(res, 404, { error: "Rota nao encontrada." });
-}
-
-function handleError(res, error) {
-  const statusCode = error.statusCode || 500;
-  const message = error.message || "Erro interno do servidor.";
-  sendJson(res, statusCode, { error: message });
+  sendJson(res, 404, { error: "Rota não encontrada" });
 }
 
 async function requestListener(req, res) {
   const url = new URL(req.url, config.appUrl);
 
   try {
+    // 🔥 CALLBACK GOOGLE (CORRETO)
+    if (url.pathname === "/oauth/google/callback") {
+      const { code, state } = Object.fromEntries(url.searchParams);
+
+      if (!code || !state) {
+        sendText(res, 400, "Missing code/state");
+        return;
+      }
+
+      const userId = await handleGoogleOAuthCallback(code, state);
+
+      makeSessionCookie(res, userId);
+
+      redirect(res, "/dashboard");
+      return;
+    }
+
     if (url.pathname.startsWith("/api/")) {
       await handleApiRequest(req, res, url);
       return;
     }
 
-    if (url.pathname === "/" || !path.extname(url.pathname)) {
-      await serveIndex(res);
-      return;
-    }
-
-    await serveStaticFile(res, url.pathname);
-  } catch (error) {
-    console.error("[server]", error);
-    handleError(res, error);
+    await serveIndex(res);
+  } catch (err) {
+    console.error(err);
+    sendJson(res, 500, { error: "Erro interno" });
   }
 }
 
@@ -215,6 +192,7 @@ await ensureStore();
 await readState();
 
 const server = http.createServer(requestListener);
+
 server.listen(config.port, () => {
-  console.log(`Servidor rodando em ${config.appUrl}`);
+  console.log(`Rodando em ${config.appUrl}`);
 });
